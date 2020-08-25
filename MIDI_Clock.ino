@@ -131,6 +131,7 @@ void setup() {
   pinMode(CLOCK_QUARTER_PIN, OUTPUT);
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.setRotation(2);
   display.display();
 
   encoder.write(DEFAULT_BPM * 4);
@@ -239,7 +240,7 @@ void updateDisplay() {
   display.drawBitmap(0, 0, bmp, 32, 32, SSD1306_WHITE);
 
   // draw current bpm
-  display.setCursor(128 - textWidth, 4);
+  display.setCursor(128 - textWidth, 0);
   display.setTextSize(4);
   display.setTextColor(WHITE);
   display.print(bpm, DEC);
