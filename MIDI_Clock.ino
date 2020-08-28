@@ -26,141 +26,72 @@
 #include "icon_play_filled.h"
 #include "icon_play_empty.h"
 #include "icon_pause.h"
+#include "config.h"
+#include "utils.h"
 
-#define EEPROM_BPM_ADDR 0x0F
-#define DEFAULT_BPM 120
-#define MIN_BPM 30
-#define MAX_BPM 250
 
-// In board v1, the encoder is connected to plain GPIO pins (w/o external interrupt capability)
-// This could mean the encoder response is a bit less quick than desired. This anticipates
-// a board v2 where the MIDI serial and encoder are swapped around so that the encoder is
-// connected to interrupt-enabled pins.
-#define BOARD_REV_1
-
-#if defined(BOARD_REV_1)
-  #define ENC_A_PIN 8
-  #define ENC_B_PIN 9
-  #define MIDI_OUT_PIN 3
-#elif defined(BOARD_REV_2)
-  #define ENC_A_PIN 2
-  #define ENC_B_PIN 3
-  #define MIDI_OUT_PIN 9
-#else
-  #error Please select board revision BOARD_REV_1 or BOARD_REV_2
-#endif
-
-#define MIDI_IN_PIN (MIDI_OUT_PIN - 1)
-#define BUTTON_PIN 10
-#define CLOCK_2X_PIN 4
-#define CLOCK_1X_PIN 5
-#define CLOCK_HALF_PIN 6
-#define CLOCK_QUARTER_PIN 7
-
-#define CREATE_TICK_HANDLER(name, pin_id) void name() { \
-        static uint8_t state = LOW; \
-        digitalWrite(pin_id, state); \
-        state = flipPinState(state); }
-
+// Resources
 SoftwareSerial midiOut(MIDI_IN_PIN, MIDI_OUT_PIN);
-
 Encoder encoder(ENC_A_PIN, ENC_B_PIN);
-
 Adafruit_SSD1306 display(128, 32);
 
-// Global state
+// ==== Global state ====
+volatile uint8_t tickCount = 0;
+
 uint16_t bpm = DEFAULT_BPM;
 uint16_t encValue = bpm * 4;
-uint8_t playIconValue = 0;
-bool isPaused = false;
+
 uint8_t prevPlayIconValue = 0;
+uint8_t playIconValue = 0;
+
+bool isPaused = false;
+
 bool shouldUpdateDisplay = false;
+// ==== End global state ====
 
-inline uint32_t bpmToUs(uint32_t bpm);
-void midiTickHandler(void);
-void midiKeepaliveHandler(void);
-void timesTwoTickHandler(void);
-void timesOneTickHandler(void);
-void halfTickHandler(void);
-void quarterTickHandler(void);
+// The analogue pulse tickers create a square wave where the rising edge is
+// at 2x BPM, 1x BPM, BPM / 2, and BPM / 4. The MIDI pulse ticker sends a
+// MIDI realtime clock message every 1/24th of a beat.
+CREATE_TICK_HANDLER(timesTwoTickHandler, CLOCK_2X_PIN);
+CREATE_TICK_HANDLER(timesOneTickHandler, CLOCK_1X_PIN);
+CREATE_TICK_HANDLER(halfTickHandler, CLOCK_HALF_PIN);
+CREATE_TICK_HANDLER(quarterTickHandler, CLOCK_QUARTER_PIN);
 
+ISR(TIMER1_COMPA_vect, ISR_BLOCK) {
+  tickCount++;
+  midiOut.write(MIDI_PULSE_MSG);
+
+  // Ticks are every 1/24th of a beat
+  // tickCount / 12 = 1/2 of a beat
+  // tickCount / 24 = 1 beat
+  // tickCount / 48 = 2 beats
+  // tickCount / 96 = 4 beats
+  // each needs to be halved to get the right duty cycle when flipping pins
+  if (tickCount % 48 == 0) {
+    quarterTickHandler();
+    tickCount = 0;
+  } 
+  if (tickCount % 24 == 0) {
+    halfTickHandler();
+  } 
+  if (tickCount % 12 == 0) {
+    playIconValue = playIconValue ? 0 : 1;
+    timesOneTickHandler();
+  } 
+  if (tickCount % 6 == 0) {
+    timesTwoTickHandler();
+  }
+}
 
 // The MIDI idle ticker sends the keepalive message every 270ms. This will
 // only be active if the clock is *not* running, otherwise other MIDI
 // compliant devices may decide to stop cooperating.
-Ticker tickerMidiKeepalive(midiKeepaliveHandler, 270, 0, MILLIS);
-
-// The analogue pulse tickers create a square wave where the rising edge is
-// at 2x BPM, 1x BPM, BPM / 2, and BPM / 4
-CREATE_TICK_HANDLER(timesTwoTickHandler, CLOCK_2X_PIN);
-Ticker timesTwoTicker(timesTwoTickHandler, bpmToUs(bpm) / 4, 0, MICROS_MICROS);
-
-void timesOneTickHandler(void) {
-  static uint8_t state = LOW;
-  digitalWrite(CLOCK_1X_PIN, state);
-  state = flipPinState(state);
-  playIconValue = playIconValue == 1 ? 0 : 1;
-}
-Ticker timesOneTicker(timesOneTickHandler, bpmToUs(bpm) / 2, 0, MICROS_MICROS);
-
-CREATE_TICK_HANDLER(halfTickHandler, CLOCK_HALF_PIN);
-Ticker halfTicker(halfTickHandler, bpmToUs(bpm), 0, MICROS);
-
-CREATE_TICK_HANDLER(quarterTickHandler, CLOCK_QUARTER_PIN);
-Ticker quarterTicker(quarterTickHandler, bpmToUs(bpm) * 2, 0, MICROS_MICROS);
-
-const uint8_t MIDI_PULSE_MSG = 0xF8;
-ISR(TIMER1_COMPA_vect, ISR_BLOCK) {
-  midiOut.write(MIDI_PULSE_MSG);
-}
-
-const uint8_t MIDI_KEEPALIVE_MSG = 0xFE;
 void midiKeepaliveHandler() {
   midiOut.write(MIDI_KEEPALIVE_MSG);
   midiOut.flush();
 }
 
-void setupTimer1(void) {
-  noInterrupts();
-  // Enable Timer1
-  PRR &= ~(1<<PRTIM1);
-
-  // Set Timer1 to count up to the compare value and then reset
-  TCCR1A &= ~((1<<WGM10) | (1<<WGM11));
-  TCCR1B |= (1<<WGM12);
-  TCCR1B &= ~(1<<WGM13);
-
-  // Set Timer1 interrupts for compare value reached
-  TIMSK1 |= (1<<OCIE1A);
-  interrupts();
-}
-
-void setTimer1Bpm(uint8_t bpm) {
-  // Calculate the compare value to set
-  float bpmMidiTickFrequency = ((float) bpm) / 60.0f * 24.0f;
-
-  // compareValue = clockSpeed / prescaler / bpmMidiTickFrequency
-  uint16_t compareValue = 16000000 / 64 / bpmMidiTickFrequency;
-  
-  // Load the compare register with the compare value
-  OCR1A = compareValue;
-}
-
-void startTimer1(void) {
-  noInterrupts();
-  // Start the timer (prescaler set to 64)
-  TCNT1 = 0;
-  TCCR1B |= (1<<CS11) | (1<<CS10);
-  TCCR1B &= ~(1<<CS12);
-  interrupts();
-}
-
-void stopTimer1(void) {
-  noInterrupts();
-  // Stop the timer
-  TCCR1B &= ~((1<<CS12) | (1<<CS11) | (1<<CS10));
-  interrupts();
-}
+Ticker tickerMidiKeepalive(midiKeepaliveHandler, 270, 0, MILLIS);
 
 void updateDisplay(void);
 void setup() {
@@ -177,11 +108,6 @@ void setup() {
 
   encoder.write(DEFAULT_BPM * 4);
 
-  timesTwoTicker.start();
-  timesOneTicker.start();
-  halfTicker.start();
-  quarterTicker.start();
-
   uint8_t eepromBpm = EEPROM.read(EEPROM_BPM_ADDR);
   if (eepromBpm >= MIN_BPM && eepromBpm <= MAX_BPM) {
     bpm = eepromBpm;
@@ -196,15 +122,12 @@ void setup() {
   startTimer1();
 }
 
+void tickTask(void);
 void encoderTask(void);
 void buttonTask(void);
 void displayTask(void);
 void loop() {
   tickerMidiKeepalive.update();
-  timesTwoTicker.update();
-  timesOneTicker.update();
-  halfTicker.update();
-  quarterTicker.update();
 
   encoderTask();
   buttonTask();
@@ -226,17 +149,9 @@ void buttonTask(void) {
         // is really the only place we can persist the selected BPM.
         // EEPROM.update(EEPROM_BPM_ADDR, bpm);
         stopTimer1();
-        timesTwoTicker.stop();
-        timesOneTicker.stop();
-        halfTicker.stop();
-        quarterTicker.stop();
         tickerMidiKeepalive.start();
       } else {
         startTimer1();
-        timesTwoTicker.start();
-        timesOneTicker.start();
-        halfTicker.start();
-        quarterTicker.start();
         tickerMidiKeepalive.stop();
       }
     }
@@ -250,10 +165,6 @@ void encoderTask(void) {
     if (newBpm != bpm) {
       bpm = newBpm;
       setTimer1Bpm(bpm);
-      timesTwoTicker.interval(bpmToUs(bpm) / 4);
-      timesOneTicker.interval(bpmToUs(bpm) / 2);
-      halfTicker.interval(bpmToUs(bpm));
-      quarterTicker.interval(bpmToUs(bpm) * 2);
 
       encValue = bpm * 4;
       encoder.write(encValue);
@@ -301,13 +212,4 @@ void updateDisplay(void) {
   display.setTextColor(WHITE);
   display.print(bpm, DEC);
   display.display();
-}
-
-// Gets the beat period in microseconds
-inline uint32_t bpmToUs(uint32_t bpm) {
-  return 60000 / bpm * 1000;
-}
-
-inline uint8_t flipPinState(uint8_t pinState) {
-  return pinState == HIGH ? LOW : HIGH;
 }
