@@ -73,6 +73,8 @@ uint16_t bpm = DEFAULT_BPM;
 uint16_t encValue = bpm * 4;
 uint8_t playIconValue = 0;
 bool isPaused = false;
+uint8_t prevPlayIconValue = 0;
+bool shouldUpdateDisplay = false;
 
 inline uint32_t bpmToUs(uint32_t bpm);
 void midiTickHandler(void);
@@ -82,8 +84,6 @@ void timesOneTickHandler(void);
 void halfTickHandler(void);
 void quarterTickHandler(void);
 
-// The MIDI clock ticker conforms to the MIDI spec of 24 ticks per beat
-Ticker tickerMidi(midiTickHandler, bpmToUs(bpm) / 24, 0, MICROS_MICROS);
 
 // The MIDI idle ticker sends the keepalive message every 270ms. This will
 // only be active if the clock is *not* running, otherwise other MIDI
@@ -110,9 +110,8 @@ CREATE_TICK_HANDLER(quarterTickHandler, CLOCK_QUARTER_PIN);
 Ticker quarterTicker(quarterTickHandler, bpmToUs(bpm) * 2, 0, MICROS_MICROS);
 
 const uint8_t MIDI_PULSE_MSG = 0xF8;
-void midiTickHandler() {
+ISR(TIMER1_COMPA_vect, ISR_BLOCK) {
   midiOut.write(MIDI_PULSE_MSG);
-  midiOut.flush();
 }
 
 const uint8_t MIDI_KEEPALIVE_MSG = 0xFE;
@@ -121,9 +120,51 @@ void midiKeepaliveHandler() {
   midiOut.flush();
 }
 
-void updateDisplay(void);
+void setupTimer1(void) {
+  noInterrupts();
+  // Enable Timer1
+  PRR &= ~(1<<PRTIM1);
 
+  // Set Timer1 to count up to the compare value and then reset
+  TCCR1A &= ~((1<<WGM10) | (1<<WGM11));
+  TCCR1B |= (1<<WGM12);
+  TCCR1B &= ~(1<<WGM13);
+
+  // Set Timer1 interrupts for compare value reached
+  TIMSK1 |= (1<<OCIE1A);
+  interrupts();
+}
+
+void setTimer1Bpm(uint8_t bpm) {
+  // Calculate the compare value to set
+  float bpmMidiTickFrequency = ((float) bpm) / 60.0f * 24.0f;
+
+  // compareValue = clockSpeed / prescaler / bpmMidiTickFrequency
+  uint16_t compareValue = 16000000 / 64 / bpmMidiTickFrequency;
+  
+  // Load the compare register with the compare value
+  OCR1A = compareValue;
+}
+
+void startTimer1(void) {
+  noInterrupts();
+  // Start the timer (prescaler set to 64)
+  TCNT1 = 0;
+  TCCR1B |= (1<<CS11) | (1<<CS10);
+  TCCR1B &= ~(1<<CS12);
+  interrupts();
+}
+
+void stopTimer1(void) {
+  noInterrupts();
+  // Stop the timer
+  TCCR1B &= ~((1<<CS12) | (1<<CS11) | (1<<CS10));
+  interrupts();
+}
+
+void updateDisplay(void);
 void setup() {
+  Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(CLOCK_2X_PIN, OUTPUT);
   pinMode(CLOCK_1X_PIN, OUTPUT);
@@ -136,7 +177,6 @@ void setup() {
 
   encoder.write(DEFAULT_BPM * 4);
 
-  tickerMidi.start();
   timesTwoTicker.start();
   timesOneTicker.start();
   halfTicker.start();
@@ -147,28 +187,69 @@ void setup() {
     bpm = eepromBpm;
   }
 
+  midiOut.begin(31250);
+
   updateDisplay();
+
+  setupTimer1();
+  setTimer1Bpm(bpm);
+  startTimer1();
 }
 
+void encoderTask(void);
+void buttonTask(void);
+void displayTask(void);
 void loop() {
-  static auto msCounter = millis();
-  static uint8_t prevPlayIconValue = 0;
-  static auto shouldUpdateDisplay = false;
-  static uint8_t oldButtonState = HIGH;
-
-  tickerMidi.update();
   tickerMidiKeepalive.update();
   timesTwoTicker.update();
   timesOneTicker.update();
   halfTicker.update();
   quarterTicker.update();
 
+  encoderTask();
+  buttonTask();
+  displayTask();
+}
+
+void buttonTask(void) {
+  static uint8_t oldButtonState = HIGH;
+
+  auto buttonState = digitalRead(BUTTON_PIN);
+  if (oldButtonState != buttonState) {
+    oldButtonState = buttonState;
+    if (buttonState == LOW) {
+      isPaused = isPaused ? false : true;
+      shouldUpdateDisplay = true;
+      if (isPaused) {
+        // Updating the EEPROM is very slow - 3.3ms - which is
+        // unacceptable if a MIDI device is running. So this
+        // is really the only place we can persist the selected BPM.
+        // EEPROM.update(EEPROM_BPM_ADDR, bpm);
+        stopTimer1();
+        timesTwoTicker.stop();
+        timesOneTicker.stop();
+        halfTicker.stop();
+        quarterTicker.stop();
+        tickerMidiKeepalive.start();
+      } else {
+        startTimer1();
+        timesTwoTicker.start();
+        timesOneTicker.start();
+        halfTicker.start();
+        quarterTicker.start();
+        tickerMidiKeepalive.stop();
+      }
+    }
+  }
+}
+
+void encoderTask(void) {
   auto newEncValue = encoder.read();
   auto newBpm = newEncValue / 4;
   if (newBpm >= MIN_BPM && newBpm <= MAX_BPM) {
     if (newBpm != bpm) {
       bpm = newBpm;
-      tickerMidi.interval(bpmToUs(bpm) / 24);
+      setTimer1Bpm(bpm);
       timesTwoTicker.interval(bpmToUs(bpm) / 4);
       timesOneTicker.interval(bpmToUs(bpm) / 2);
       halfTicker.interval(bpmToUs(bpm));
@@ -187,35 +268,10 @@ void loop() {
     shouldUpdateDisplay = true;
     prevPlayIconValue = playIconValue;
   }
+}
 
-  auto buttonState = digitalRead(BUTTON_PIN);
-  if (oldButtonState != buttonState) {
-    oldButtonState = buttonState;
-    if (buttonState == LOW) {
-      isPaused = isPaused ? false : true;
-      shouldUpdateDisplay = true;
-      if (isPaused) {
-        // Updating the EEPROM is very slow - 3.3ms - which is
-        // unacceptable if a MIDI device is running. So this
-        // is really the only place we can persist the selected BPM.
-        EEPROM.update(EEPROM_BPM_ADDR, bpm);
-        tickerMidi.stop();
-        timesTwoTicker.stop();
-        timesOneTicker.stop();
-        halfTicker.stop();
-        quarterTicker.stop();
-        tickerMidiKeepalive.start();
-      } else {
-        tickerMidi.start();
-        timesTwoTicker.start();
-        timesOneTicker.start();
-        halfTicker.start();
-        quarterTicker.start();
-        tickerMidiKeepalive.stop();
-      }
-    }
-  }
-
+void displayTask(void) {
+  static auto msCounter = millis();
   auto ms = millis();
   if (ms - msCounter >= 30 && shouldUpdateDisplay) {
     updateDisplay();
@@ -224,7 +280,7 @@ void loop() {
   }
 }
 
-void updateDisplay() {
+void updateDisplay(void) {
   auto textWidth = 5 * 4 * (bpm >= 100 ? 4 : 3);
   display.clearDisplay();
 
