@@ -184,7 +184,7 @@ void encoderTask(void) {
 void displayTask(void) {
   static auto msCounter = millis();
   auto ms = millis();
-  if (ms - msCounter >= 30 && shouldUpdateDisplay) {
+  if (ms - msCounter >= 16 && shouldUpdateDisplay) {
     updateDisplay();
     shouldUpdateDisplay = false;
     msCounter = ms;
